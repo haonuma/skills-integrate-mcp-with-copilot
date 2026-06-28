@@ -5,10 +5,13 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Cookie, FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
@@ -18,6 +21,45 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+SESSION_COOKIE_NAME = "teacher_session"
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _load_teachers() -> dict[str, str]:
+    teachers_file = current_dir / "teachers.json"
+    with teachers_file.open("r", encoding="utf-8") as f:
+        teachers = json.load(f)
+
+    return {
+        teacher["username"]: teacher["password"]
+        for teacher in teachers
+        if "username" in teacher and "password" in teacher
+    }
+
+
+teachers = _load_teachers()
+teacher_sessions: dict[str, str] = {}
+
+
+def _get_logged_in_teacher(session_token: str | None) -> str | None:
+    if not session_token:
+        return None
+    return teacher_sessions.get(session_token)
+
+
+def _require_teacher(session_token: str | None) -> str:
+    teacher_username = _get_logged_in_teacher(session_token)
+    if not teacher_username:
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher login required"
+        )
+    return teacher_username
 
 # In-memory activity database
 activities = {
@@ -88,9 +130,54 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def teacher_login(payload: LoginRequest, response: Response):
+    expected_password = teachers.get(payload.username)
+    if not expected_password or payload.password != expected_password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = secrets.token_urlsafe(32)
+    teacher_sessions[session_token] = payload.username
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax"
+    )
+    return {"message": "Login successful", "username": payload.username}
+
+
+@app.post("/auth/logout")
+def teacher_logout(
+    response: Response,
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
+):
+    if session_token:
+        teacher_sessions.pop(session_token, None)
+    response.delete_cookie(key=SESSION_COOKIE_NAME)
+    return {"message": "Logged out"}
+
+
+@app.get("/auth/session")
+def teacher_session(
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
+):
+    teacher_username = _get_logged_in_teacher(session_token)
+    if not teacher_username:
+        return {"logged_in": False}
+
+    return {"logged_in": True, "username": teacher_username}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
+):
     """Sign up a student for an activity"""
+    _require_teacher(session_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +198,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
+):
     """Unregister a student from an activity"""
+    _require_teacher(session_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
